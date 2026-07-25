@@ -9,6 +9,25 @@ from pathlib import Path
 from typing import Callable
 
 
+def drop_failed(output_path: Path, id_field: str = "id") -> int:
+    """Removes recorded failures from a predictions file so a later run
+    reclassifies them. Returns the number of rows dropped.
+
+    Resumability records failures the same way it records successes, which means a
+    transient error -- an expired session, a rate limit, the CLI updating itself
+    mid-run -- becomes permanent: the id is in the file, so every subsequent run
+    skips it. Deleting the whole file to recover throws away every good
+    classification alongside the bad ones, which on a long run is most of the work.
+    """
+    if not output_path.exists():
+        return 0
+    rows = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
+    keep = [r for r in rows if "error" not in r]
+    if len(keep) != len(rows):
+        output_path.write_text("".join(json.dumps(r) + "\n" for r in keep))
+    return len(rows) - len(keep)
+
+
 class BlindClassifier:
     """Runs a prompt template against every item in a dataset via the Claude Code
     CLI. The CLI is expected to auto-load a CLAUDE.md in `cwd` that defines the
@@ -49,14 +68,40 @@ class BlindClassifier:
         items: list[dict],
         output_path: Path,
         on_progress: Callable[[str, dict], None] | None = None,
+        retry_failed: bool = False,
     ) -> None:
         """Classifies every item not already present in output_path. Safe to
-        interrupt and re-run -- already-classified ids are skipped."""
+        interrupt and re-run -- already-classified ids are skipped.
+
+        Recorded failures count as present, so they are skipped too. Pass
+        `retry_failed=True` to drop them first and reclassify only those. It is not
+        the default because an item that fails deterministically -- malformed input,
+        a prompt the model always refuses -- would retry on every run and never
+        converge; opting in keeps a run guaranteed to terminate.
+        """
+        if retry_failed:
+            dropped = drop_failed(output_path, self.id_field)
+            print(f"Dropped {dropped} failed rows for retry", file=sys.stderr)
+
         already_done: set[str] = set()
+        failed: set[str] = set()
         if output_path.exists():
-            already_done = {json.loads(l)[self.id_field] for l in output_path.open()}
+            for line in output_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                already_done.add(record[self.id_field])
+                if "error" in record:
+                    failed.add(record[self.id_field])
         remaining = [it for it in items if it[self.id_field] not in already_done]
-        print(f"Resuming: {len(already_done)} already done, {len(remaining)} remaining", file=sys.stderr)
+
+        status = f"Resuming: {len(already_done)} already done, {len(remaining)} remaining"
+        if failed:
+            status += (
+                f"\nWARNING: {len(failed)} recorded failures are being skipped as done."
+                " Pass retry_failed=True to reclassify them."
+            )
+        print(status, file=sys.stderr)
 
         with output_path.open("a") as out:
             for i, item in enumerate(remaining, 1):

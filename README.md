@@ -49,6 +49,34 @@ A project using this kit provides:
 `eval_kit` never sees the domain logic. It only orchestrates calling the classifier,
 scoring what comes back, and writing the report.
 
+### Resuming, and recovering from a failed run
+
+`BlindClassifier.run()` appends each result as it lands and skips ids already in the
+output file, so an interrupted run picks up where it stopped.
+
+Failures are recorded the same way successes are, which makes them **sticky**: the id
+is in the file, so every later run skips it. That is deliberate — an item that fails
+deterministically would otherwise retry forever and the run would never converge — but
+it means a *transient* failure needs an explicit escape hatch:
+
+```python
+classifier.run(items, predictions_path, retry_failed=True)
+```
+
+That drops the recorded error rows first, so the next pass reclassifies only those and
+keeps everything that already succeeded. `drop_failed(path)` is exported separately if
+you want the same behavior outside a run.
+
+`run()` also warns when the output file contains failures it is about to skip. Without
+that, a run where every call failed reports `32 already done, 0 remaining` and exits
+looking like a success — which is exactly how a broken run gets mistaken for a
+finished one.
+
+This came out of [deflection-audit](https://github.com/neeshykha/deflection-audit),
+where the Claude Code CLI updated itself mid-run and its symlink briefly vanished,
+taking out 16 of 32 conversations. Deleting the file to recover would have thrown away
+the 16 that worked.
+
 ---
 
 ## Example: Support Triage
@@ -92,6 +120,16 @@ python3 run_example.py
 ```
 
 Resumable — if interrupted, re-running skips tickets already in `predictions.jsonl`.
+
+### Tests
+
+```bash
+python3 -m unittest discover tests
+```
+
+Covers the resumability file handling only — stdlib `unittest`, so the kit keeps its
+zero-dependency install. Classification itself is stochastic and gets an eval rather
+than assertions; the scorecard is that measurement.
 
 ---
 
